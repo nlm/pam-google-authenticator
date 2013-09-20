@@ -54,6 +54,13 @@ Currently, the following options are recognized:
     for most users as invalid login attempts and generated-but-not-used
     tokens both contribute to synchronization problems.
 
+  RHOST_WHITELIST host1[,host2[...]]
+    this optional parameter permits to bypass passcode from trusted locations.
+    the argument is a space or comma-separated list of hostnames. note that
+    the info is retrieved from PAM_RHOST field, and is dependent from the
+    application reporting it. it can either be a hostname or IP (see your
+    auth log for informations)
+
 
 Any all-numeric sequence of eight-digit numbers are randomly generated
 one-time tokens. The user can enter any arbitrary one-time code
