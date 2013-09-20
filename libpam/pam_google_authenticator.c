@@ -133,6 +133,18 @@ static const char *get_user_name(pam_handle_t *pamh) {
   return username;
 }
 
+static const char *get_rhost(pam_handle_t *pamh) {
+  // Obtain remote hostname
+  const char *rhost;
+  if (pam_get_item(pamh, PAM_RHOST, (void *)&rhost) != PAM_SUCCESS ||
+      !rhost || !*rhost) {
+    log_message(LOG_ERR, pamh, "Remote host attribute not available");
+    return NULL;
+  }
+  log_message(LOG_ERR, pamh, rhost);
+  return rhost;
+}
+
 static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
                                  const char *username, int *uid) {
   // Check whether the administrator decided to override the default location
@@ -637,6 +649,42 @@ static long get_hotp_counter(pam_handle_t *pamh, const char *buf) {
   free((void *)counter_str);
 
   return counter;
+}
+
+static int rhost_whitelist(pam_handle_t *pamh, const char *secret_filename,
+                      int *whitelisted, char **buf) {
+  const char *value = get_cfg_value(pamh, "RHOST_WHITELIST", *buf);
+  if (!value) {
+    // Whitelist is not enabled for this account
+    return 0;
+  } else if (value == &oom) {
+    // Out of memory. This is a fatal error.
+    return -1;
+  }
+
+  const char *rhost = get_rhost(pamh);
+  if (!rhost) {
+    // No PAM_RHOST available
+    return 0;
+  }
+
+  const char *endptr = value, *ptr = value;
+  while (*endptr && *endptr != '\r' && *endptr != '\n')
+  {
+    endptr += strcspn(endptr, ", \r\n");
+    if (strlen(rhost) == endptr - ptr &&
+      memcmp(ptr, rhost, endptr - ptr) == 0)
+    {
+      free((void *)value);
+      //log_message(LOG_DEBUG, pamh, "Host is whitelisted");
+      *whitelisted = 1;
+      return -1;
+    }
+    ptr = endptr += strspn(endptr, ", ");
+  }
+
+  free((void *)value);
+  return 0;
 }
 
 static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
@@ -1347,7 +1395,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   }
 
   // Read and process status file, then ask the user for the verification code.
-  int early_updated = 0, updated = 0;
+  int early_updated = 0, updated = 0, whitelisted = 0;
   if ((username = get_user_name(pamh)) &&
       (secret_filename = get_secret_filename(pamh, &params, username, &uid)) &&
       !drop_privileges(pamh, username, uid, &old_uid, &old_gid) &&
@@ -1355,6 +1403,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
                              &filesize, &mtime)) >= 0 &&
       (buf = read_file_contents(pamh, secret_filename, &fd, filesize)) &&
       (secret = get_shared_secret(pamh, secret_filename, buf, &secretLen)) &&
+       rhost_whitelist(pamh, secret_filename, &whitelisted, &buf) >= 0 &&
        rate_limit(pamh, secret_filename, &early_updated, &buf) >= 0) {
     long hotp_counter = get_hotp_counter(pamh, buf);
     int must_advance_counter = 0;
@@ -1528,6 +1577,11 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   // the administrator set the "nullok" option, this PAM module completes
   // successfully, without ever prompting the user.
   if (params.nullok == SECRETNOTFOUND) {
+    rc = PAM_SUCCESS;
+  }
+
+  // If host is whitelisted, allow access
+  if (whitelisted) {
     rc = PAM_SUCCESS;
   }
 
