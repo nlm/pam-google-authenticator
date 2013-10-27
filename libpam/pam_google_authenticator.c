@@ -56,9 +56,12 @@
 
 #define MODULE_NAME "pam_google_authenticator"
 #define SECRET      "~/.google_authenticator"
+#define AUTH_CACHE  "~/.google_authenticator_authcache"
+#define HOSTLEN_MAX 255
 
 typedef struct Params {
   const char *secret_filename_spec;
+  const char *authcache_filename_spec;
   enum { NULLERR=0, NULLOK, SECRETNOTFOUND } nullok;
   int        noskewadj;
   int        echocode;
@@ -67,6 +70,11 @@ typedef struct Params {
   enum { PROMPT = 0, TRY_FIRST_PASS, USE_FIRST_PASS } pass_mode;
   int        forward_pass;
 } Params;
+
+typedef struct authcache_entry {
+  char rhost[HOSTLEN_MAX + 1];
+  time_t timestamp;
+} authcache_entry_t;
 
 static char oom;
 
@@ -141,7 +149,6 @@ static const char *get_rhost(pam_handle_t *pamh) {
     log_message(LOG_ERR, pamh, "Remote host attribute not available");
     return NULL;
   }
-  log_message(LOG_ERR, pamh, rhost);
   return rhost;
 }
 
@@ -233,6 +240,96 @@ static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
   *uid = params->fixed_uid ? params->uid : pw->pw_uid;
   free(buf);
   return secret_filename;
+}
+
+static char *get_authcache_filename(pam_handle_t *pamh, const Params *params,
+                                 const char *username, int *uid) {
+  // Check whether the administrator decided to override the default location
+  // for the secret file.
+  const char *spec = params->authcache_filename_spec
+    ? params->authcache_filename_spec : AUTH_CACHE;
+
+  // Obtain the user's id and home directory
+  struct passwd pwbuf, *pw = NULL;
+  char *buf = NULL;
+  char *authcache_filename = NULL;
+  if (!params->fixed_uid) {
+    #ifdef _SC_GETPW_R_SIZE_MAX
+    int len = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (len <= 0) {
+      len = 4096;
+    }
+    #else
+    int len = 4096;
+    #endif
+    buf = malloc(len);
+    *uid = -1;
+    if (buf == NULL ||
+        getpwnam_r(username, &pwbuf, buf, len, &pw) ||
+        !pw ||
+        !pw->pw_dir ||
+        *pw->pw_dir != '/') {
+    err:
+      log_message(LOG_ERR, pamh, "Failed to compute location of secret file");
+      free(buf);
+      free(authcache_filename);
+      return NULL;
+    }
+  }
+
+  // Expand filename specification to an actual filename.
+  if ((authcache_filename = strdup(spec)) == NULL) {
+    goto err;
+  }
+  int allow_tilde = 1;
+  for (int offset = 0; authcache_filename[offset];) {
+    char *cur = authcache_filename + offset;
+    char *var = NULL;
+    size_t var_len = 0;
+    const char *subst = NULL;
+    if (allow_tilde && *cur == '~') {
+      var_len = 1;
+      if (!pw) {
+        goto err;
+      }
+      subst = pw->pw_dir;
+      var = cur;
+    } else if (authcache_filename[offset] == '$') {
+      if (!memcmp(cur, "${HOME}", 7)) {
+        var_len = 7;
+        if (!pw) {
+          goto err;
+        }
+        subst = pw->pw_dir;
+        var = cur;
+      } else if (!memcmp(cur, "${USER}", 7)) {
+        var_len = 7;
+        subst = username;
+        var = cur;
+      }
+    }
+    if (var) {
+      size_t subst_len = strlen(subst);
+      char *resized = realloc(authcache_filename,
+                              strlen(authcache_filename) + subst_len);
+      if (!resized) {
+        goto err;
+      }
+      var += resized - authcache_filename;
+      authcache_filename = resized;
+      memmove(var + subst_len, var + var_len, strlen(var + var_len) + 1);
+      memmove(var, subst, subst_len);
+      offset = var + subst_len - resized;
+      allow_tilde = 0;
+    } else {
+      allow_tilde = *cur == '/';
+      ++offset;
+    }
+  }
+
+  *uid = params->fixed_uid ? params->uid : pw->pw_uid;
+  free(buf);
+  return authcache_filename;
 }
 
 static int setuser(int uid) {
@@ -386,6 +483,17 @@ static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
   return fd;
 }
 
+static int open_authcache_file(pam_handle_t *pamh,
+                                const char *authcache_filename) {
+  // Try to open "~/.google_authenticator_authcache"
+  int fd = open(authcache_filename, O_RDWR | O_CREAT | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+  if (fd < 0) {
+      log_message(LOG_ERR, pamh, "Failed to open \"%s\"", authcache_filename);
+      return -1;
+  }
+  return fd;
+}
+
 static char *read_file_contents(pam_handle_t *pamh,
                                 const char *secret_filename, int *fd,
                                 off_t filesize) {
@@ -525,6 +633,14 @@ static int comparator(const void *a, const void *b) {
 static char *get_cfg_value(pam_handle_t *pamh, const char *key,
                            const char *buf) {
   size_t key_len = strlen(key);
+
+  if (!buf)
+  {
+    log_message(LOG_ERR, pamh, "get_cfg_value: buf == NULL for key :");
+    log_message(LOG_ERR, pamh, key);
+    return NULL;
+  }
+
   for (const char *line = buf; *line; ) {
     const char *ptr;
     if (line[0] == '"' && line[1] == ' ' && !memcmp(line+2, key, key_len) &&
@@ -651,9 +767,155 @@ static long get_hotp_counter(pam_handle_t *pamh, const char *buf) {
   return counter;
 }
 
-static int rhost_whitelist(pam_handle_t *pamh, const char *secret_filename,
-                      int *whitelisted, char **buf) {
-  const char *value = get_cfg_value(pamh, "RHOST_WHITELIST", *buf);
+static int authcache_update(pam_handle_t *pamh,
+                              const char *authcache_filename, const char *buf) {
+  const char *value = get_cfg_value(pamh, "AUTH_CACHE", buf);
+
+  if (!value) {
+    // Authcache is not enabled for this account
+    return 0;
+  } else if (value == &oom) {
+    // Out of memory. This is a fatal error.
+    return -1;
+  }
+
+  const char *rhost = get_rhost(pamh);
+  if (!rhost) {
+    // No PAM_RHOST available
+    return -1;
+  }
+
+  int fd;
+  if (!((fd = open_authcache_file(pamh, authcache_filename)) >= 0)) {
+    // Unable to open authcache file
+    return -1;
+  }
+
+  authcache_entry_t e;
+  memset(&e, 0, sizeof(e));
+  ssize_t size;
+  // Read authcache file
+  while ((size = read(fd, &e, sizeof(e))) > 0) {
+    if (size != sizeof(e)) {
+      // Data error
+      close(fd);
+      return -1;
+    }
+    if (strcmp(e.rhost, rhost) == 0) {
+      e.timestamp = time(NULL);
+      if (lseek(fd, -sizeof(e), SEEK_CUR) < 0 ||
+          write(fd, &e, sizeof(e)) != sizeof(e)) {
+        close(fd);
+        return -1;
+      }
+      close(fd);
+      return 1;
+    }
+  }  
+
+  memset(&e, 0, sizeof(e));
+  strncpy(e.rhost, rhost, HOSTLEN_MAX);
+  e.rhost[strlen(rhost)] = '\0';
+  e.timestamp = time(NULL);
+  if (write(fd, &e, sizeof(e)) != sizeof(e)) {
+    close(fd);
+    return -1;
+  }
+
+  close(fd);
+  return 1;
+}
+
+static int authcache_whitelist(pam_handle_t *pamh, const char *authcache_filename,
+                      int *whitelisted, char *buf) {
+  const char *value = get_cfg_value(pamh, "AUTH_CACHE", buf);
+  if (!value) {
+    // Authcache is not enabled for this account
+    return 0;
+  } else if (value == &oom) {
+    // Out of memory. This is a fatal error.
+    return -1;
+  }
+
+  const char *rhost = get_rhost(pamh);
+  if (!rhost) {
+    // No PAM_RHOST available
+    log_message(LOG_ERR, pamh, "PAM 'rhost' not available");
+    return 0;
+  }
+
+  char *endptr;
+  long int cachetime = strtol(value, &endptr, 10);
+
+  if (endptr == value) {
+    // Value did not contain any digits
+    log_message(LOG_ERR, pamh, "invalid value for AUTH_CACHE");
+    return 0;
+  }
+
+  const char *unit = endptr;
+  endptr += strcspn(endptr, "\r\n");
+  if (endptr - unit > 1) {
+    // Invalid Unit
+    log_message(LOG_ERR, pamh, "invalid unit for AUTH_CACHE");
+    return 0;
+  }
+
+  if (memcmp(unit, "s", endptr - unit) == 0)
+    cachetime *= 1;
+  else if (memcmp(unit, "m", endptr - unit) == 0)
+    cachetime *= 60;
+  else if (memcmp(unit, "h", endptr - unit) == 0)
+    cachetime *= 3600;
+  else if (memcmp(unit, "d", endptr - unit) == 0)
+    cachetime *= 86400;
+  else
+    return 0;
+
+  int fd;
+  if (!((fd = open_authcache_file(pamh, authcache_filename)) >= 0)) {
+    // Unable to open authcache file
+    log_message(LOG_ERR, pamh, "unable to open authcache file");
+    return 0;
+  }
+
+  authcache_entry_t e;
+  ssize_t size;
+  time_t now = time(NULL);
+
+  if (now < 0) {
+    // time() returned an error
+    log_message(LOG_ERR, pamh, "time() returned error");
+    close(fd);
+    return 0;
+  }
+
+  // Read authcache file
+  while ((size = read(fd, &e, sizeof(e))) > 0) {
+    if (size != sizeof(e)) {
+      // Data error
+      log_message(LOG_ERR, pamh, "data error");
+      close(fd);
+      return 0;
+    }
+    if (strcmp(e.rhost, rhost) == 0) {
+      if (e.timestamp < now && e.timestamp > now - cachetime) {
+        log_message(LOG_INFO, pamh, "access granted by auth cache");
+        *whitelisted = 1;
+        close(fd);
+        return -1;
+      }
+      return 0;
+    }
+  }  
+
+  // Not found
+  close(fd);
+  return 0;
+}
+
+static int rhost_whitelist(pam_handle_t *pamh, int *whitelisted, char *buf) {
+  const char *value = get_cfg_value(pamh, "RHOST_WHITELIST", buf);
   if (!value) {
     // Whitelist is not enabled for this account
     return 0;
@@ -676,7 +938,7 @@ static int rhost_whitelist(pam_handle_t *pamh, const char *secret_filename,
       memcmp(ptr, rhost, endptr - ptr) == 0)
     {
       free((void *)value);
-      //log_message(LOG_DEBUG, pamh, "Host is whitelisted");
+      log_message(LOG_INFO, pamh, "access granted by rhost whitelist");
       *whitelisted = 1;
       return -1;
     }
@@ -1344,6 +1606,9 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
     if (!memcmp(argv[i], "secret=", 7)) {
       free((void *)params->secret_filename_spec);
       params->secret_filename_spec = argv[i] + 7;
+    } else if (!memcmp(argv[i], "authcache=", 10)) {
+      free((void *)params->authcache_filename_spec);
+      params->authcache_filename_spec = argv[i] + 10;
     } else if (!memcmp(argv[i], "user=", 5)) {
       uid_t uid;
       if (parse_user(pamh, argv[i] + 5, &uid) < 0) {
@@ -1376,7 +1641,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
                                 int argc, const char **argv) {
   int        rc = PAM_SESSION_ERR;
   const char *username;
-  char       *secret_filename = NULL;
+  char       *secret_filename = NULL, *authcache_filename = NULL;
   int        uid = -1, old_uid = -1, old_gid = -1, fd = -1;
   off_t      filesize = 0;
   time_t     mtime = 0;
@@ -1395,15 +1660,17 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   }
 
   // Read and process status file, then ask the user for the verification code.
-  int early_updated = 0, updated = 0, whitelisted = 0;
+  int early_updated = 0, updated = 0, rhost_whitelisted = 0, authcache_whitelisted = 0;
   if ((username = get_user_name(pamh)) &&
       (secret_filename = get_secret_filename(pamh, &params, username, &uid)) &&
+      (authcache_filename = get_authcache_filename(pamh, &params, username, &uid)) &&
       !drop_privileges(pamh, username, uid, &old_uid, &old_gid) &&
       (fd = open_secret_file(pamh, secret_filename, &params, username, uid,
                              &filesize, &mtime)) >= 0 &&
       (buf = read_file_contents(pamh, secret_filename, &fd, filesize)) &&
       (secret = get_shared_secret(pamh, secret_filename, buf, &secretLen)) &&
-       rhost_whitelist(pamh, secret_filename, &whitelisted, &buf) >= 0 &&
+       rhost_whitelist(pamh, &rhost_whitelisted, buf) >= 0 &&
+       authcache_whitelist(pamh, authcache_filename, &authcache_whitelisted, buf) >= 0 &&
        rate_limit(pamh, secret_filename, &early_updated, &buf) >= 0) {
     long hotp_counter = get_hotp_counter(pamh, buf);
     int must_advance_counter = 0;
@@ -1581,8 +1848,15 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   }
 
   // If host is whitelisted, allow access
-  if (whitelisted) {
+  if (rhost_whitelisted || authcache_whitelisted) {
     rc = PAM_SUCCESS;
+  }
+
+  // If manual auth is successful, update authcache
+  if (rc == PAM_SUCCESS && !rhost_whitelisted && !authcache_whitelisted && buf) {
+    if (!authcache_update(pamh, authcache_filename, buf) < 0) {
+      log_message(LOG_EMERG, pamh, "Unable to write authcache");
+    }
   }
 
   // Persist the new state.
@@ -1593,6 +1867,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
       rc = PAM_SESSION_ERR;
     }
   }
+
   if (fd >= 0) {
     close(fd);
   }
@@ -1608,6 +1883,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     }
   }
   free(secret_filename);
+  free(authcache_filename);
 
   // Clean up
   if (buf) {
