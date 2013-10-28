@@ -3,8 +3,8 @@ google-authenticator
 
 imported from https://code.google.com/p/google-authenticator/
 
-features added in this repository to the original project
----------------------------------------------------------
+features added in this repository
+---------------------------------
 
 ### RHOST_WHITELIST option
 
