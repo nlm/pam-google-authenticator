@@ -61,10 +61,16 @@ Currently, the following options are recognized:
     application reporting it. it can either be a hostname or IP (see your
     auth log for informations)
 
+  AUTH_CACHE nu
+    this optional parameter enable authentication cache, allowing user not to
+    enter verification code every time it logs in. Instead, in case of a
+    successful authentication, the code is not asked for a while.
+    "n" is a number and "u" is the time unit describing the amount of time the
+    code will not be asked. valid values for "u" are "s" (seconds),
+    "m" (minutes), "h" (hours), "d" (days). if no unit is provided, n is in
+    seconds. example: "20": 20 seconds, "1h": 1 hour, "30d": 30 days.
 
 Any all-numeric sequence of eight-digit numbers are randomly generated
 one-time tokens. The user can enter any arbitrary one-time code
 to log into his account. The code will then be removed from the file.
 
-
-  
