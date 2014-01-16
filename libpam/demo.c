@@ -85,12 +85,12 @@ int pam_get_item(const pam_handle_t *pamh, int item_type,
   switch (item_type) {
     case PAM_SERVICE: {
       static const char *service = "google_authenticator_demo";
-      memcpy(item, &service, sizeof(&service));
+      memcpy(item, &service, sizeof(service));
       return PAM_SUCCESS;
     }
     case PAM_USER: {
       char *user = getenv("USER");
-      memcpy(item, &user, sizeof(&user));
+      memcpy(item, &user, sizeof(user));
       return PAM_SUCCESS;
     }
     case PAM_CONV: {
